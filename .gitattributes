@@ -1,0 +1,4 @@
+# The proxy runs on Linux. Force LF so a checkout on Windows cannot produce
+# CRLF line endings that break the shebang with exit code 203/EXEC.
+* text=auto eol=lf
+*.png binary

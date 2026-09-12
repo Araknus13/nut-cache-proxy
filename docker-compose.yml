@@ -1,0 +1,31 @@
+services:
+  nut-cache-proxy:
+    build: .
+    container_name: nut-cache-proxy
+    restart: unless-stopped
+    ports:
+      - "3493:3493"
+    environment:
+      # --- required ---------------------------------------------------------
+      # The NUT server inside your UPS. Not a hostname you made up -- the
+      # address the UPS itself answers on, port 3493.
+      UPSTREAM_HOST: 192.0.2.10
+      UPS_NAME: ups
+
+      # --- timing -----------------------------------------------------------
+      # Keep POLL_INTERVAL below your clients' POLLFREQ, and STALE_SEC well
+      # below upsmon's DEADTIME.
+      POLL_INTERVAL: "3"
+      STALE_SEC: "20"
+
+      # --- stuck-CAL protection ---------------------------------------------
+      # Read the README section before changing this. It is the difference
+      # between a harmless restart and an unplanned shutdown.
+      CAL_MAX_SEC: "120"
+
+      # --- optional: notifications ------------------------------------------
+      # EVENT_ALERTS: "true"
+      # NTFY_URL: "http://ntfy"        # ROOT url -- topic goes in the body
+      # NTFY_TOPIC: "ups"
+      # INFLUX_URL: "http://influxdb:8086"
+      # INFLUX_DB: "hardware"
