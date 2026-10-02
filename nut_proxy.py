@@ -80,6 +80,23 @@ CAL_MAX_SEC. The RAW status is kept internally and reported.
 container. A restart of the proxy while a stuck CAL flag is being delivered can shut your
 machines down.
 
+LOGGING IN UPSTREAM, AND NAMING THE ACTUAL ERROR
+After rebooting itself, the UPS this was written for refused EVERY anonymous query with
+`ERR ACCESS-DENIED` -- for 9 h 19 min, and across a firmware change. A single login with
+a monitoring user fixed it: 28 variables immediately, and afterwards even anonymous
+queries worked again. So the proxy can now log in before every `LIST VAR` / `FSD`, using
+USERNAME/PASSWORD from UPSTREAM_USER/UPSTREAM_PASS (empty = anonymous, as before). It does
+NOT send `LOGIN <ups>` -- that registers a monitoring client inside the UPS and was not
+needed for reading.
+
+The second finding of that day: for nine hours the log said "timed out", while the UPS
+answered within 0.1 s with `ERR ACCESS-DENIED`. The reader waited for `END LIST`, which
+never came. The error message hid the cause. Now every ERR line is carried verbatim as
+the error kind, and every fault gets a start, any change of error kind, and an end with
+its duration -- optionally into a log file (LOG_FILE; `docker logs` does not survive a
+container recreate), and, once it lasts longer than FAULT_ALERT_SEC, to ntfy/InfluxDB
+WITH the cause.
+
 BEHAVIOUR ON A REAL OUTAGE -- deliberately like a dropped connection, not like empty data
 If the cache has gone longer than STALE_SEC without a successful poll, the proxy still
 accepts connections but closes them IMMEDIATELY with a hard reset (SO_LINGER), before
@@ -94,6 +111,8 @@ A plausible-looking wrong answer is worse than a visible error.
 """
 import asyncio
 import json
+import logging
+import logging.handlers
 import os
 import socket
 import struct
@@ -105,6 +124,10 @@ UPSTREAM_HOST = os.environ.get("UPSTREAM_HOST", "")
 UPSTREAM_PORT = int(os.environ.get("UPSTREAM_PORT", "3493"))
 UPS_NAME = os.environ.get("UPS_NAME", "ups")
 UPS_DESCRIPTION = os.environ.get("UPS_DESCRIPTION", "UPS (via nut-cache-proxy)")
+# Optional login towards the UPS (USERNAME/PASSWORD before each query). Empty = anonymous.
+# Take these from the environment or an env file -- never write them into this file.
+UPSTREAM_USER = os.environ.get("UPSTREAM_USER", "")
+UPSTREAM_PASS = os.environ.get("UPSTREAM_PASS", "")
 
 # --- Downstream: what the clients connect to --------------------------------------
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
@@ -134,11 +157,47 @@ INFLUX_DB = os.environ.get("INFLUX_DB", "hardware")
 EVENT_MEASUREMENT = os.environ.get("EVENT_MEASUREMENT", "ups_event")
 EVENT_HOST_TAG = os.environ.get("EVENT_HOST_TAG", "ups")
 
-VERSION = "1.0"
+# --- Fault log --------------------------------------------------------------------
+# Optional log file, ideally on a bind mount: `docker logs` dies with every recreate, and
+# then the one incident you need to analyse is gone. Empty = stdout only.
+LOG_FILE = os.environ.get("LOG_FILE", "")
+# How long upstream must be failing before a fault notification goes out. Short dropouts
+# that recover within seconds are normal and should not ring; the log gets them anyway.
+# Unlike status events this does NOT depend on EVENT_ALERTS: a blind proxy means no
+# client behind it can shut down cleanly, which is a safety issue, not a statistic.
+# It still only notifies if NTFY_URL / INFLUX_URL are set.
+FAULT_ALERT_SEC = float(os.environ.get("FAULT_ALERT_SEC", "60"))
+
+VERSION = "1.1"
+
+_file_log = None
+if LOG_FILE:
+    try:
+        _file_log = logging.getLogger("nut-cache-proxy-file")
+        _h = logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=2_000_000, backupCount=5, encoding="utf-8")
+        _h.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+        _file_log.addHandler(_h)
+        _file_log.setLevel(logging.INFO)
+        _file_log.propagate = False
+    except Exception as _e:
+        print(f"Log file {LOG_FILE} not usable: {_e}", flush=True)
+        _file_log = None
 
 
-def log(msg):
+def log(msg, to_file=True):
+    """stdout always; the file only gets what the next incident analysis needs -- the
+    line per rejected client (can be dozens per minute) stays out."""
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+    if to_file and _file_log is not None:
+        try:
+            _file_log.info(msg)
+        except Exception:
+            pass
+
+
+class UpstreamErr(Exception):
+    """The UPS answered with a NUT error line (e.g. ERR ACCESS-DENIED)."""
 
 
 def ntfy(title, message, priority=3, tags=None):
@@ -199,28 +258,69 @@ def influx_write_event(kind, fields):
 cache = {"vars": {}, "raw": {}, "last_success": 0.0, "polls": 0, "poll_errors": 0}
 
 
+def _read_line(f, what):
+    line = f.readline()
+    if not line:
+        raise ConnectionError(f"UPS closed the connection during {what}")
+    return line.decode(errors="replace").rstrip("\r\n")
+
+
+def _login(s, f):
+    """USERNAME/PASSWORD, if configured. A rejected login is its own, named error --
+    never skipped silently, or you end up searching again."""
+    if not UPSTREAM_USER:
+        return
+    for command, what in ((f"USERNAME {UPSTREAM_USER}", "USERNAME"),
+                          (f"PASSWORD {UPSTREAM_PASS}", "PASSWORD")):
+        s.sendall((command + "\n").encode())
+        reply = _read_line(f, what)
+        if not reply.startswith("OK"):
+            raise UpstreamErr(f"{what}: {reply}")
+
+
 def upstream_list_var():
-    """One `LIST VAR <ups>` against the REAL UPS."""
+    """One `LIST VAR <ups>` against the REAL UPS.
+
+    Reads line by line and aborts on an ERR line IMMEDIATELY, with its wording. Reading
+    until `END LIST` instead turns `ERR ACCESS-DENIED` into a misleading "timed out".
+    """
     with socket.create_connection((UPSTREAM_HOST, UPSTREAM_PORT), timeout=5) as s:
+        f = s.makefile("rb")
+        _login(s, f)
         s.sendall(f"LIST VAR {UPS_NAME}\n".encode())
-        data = b""
-        while b"END LIST" not in data:
-            chunk = s.recv(4096)
-            if not chunk:
+        out = {}
+        while True:
+            line = _read_line(f, "LIST VAR")
+            if line.startswith("ERR"):
+                raise UpstreamErr(f"LIST VAR: {line}")
+            if line.startswith("END LIST"):
                 break
-            data += chunk
+            if line.startswith("VAR "):
+                parts = line.split(" ", 3)
+                if len(parts) == 4:
+                    out[parts[2]] = parts[3].strip().strip('"')
         s.sendall(b"LOGOUT\n")
-    out = {}
-    for line in data.decode(errors="replace").splitlines():
-        if line.startswith("VAR "):
-            parts = line.split(" ", 3)
-            if len(parts) == 4:
-                out[parts[2]] = parts[3].strip().strip('"')
     if not out:
         # An empty result is an ERROR, not an empty reading. Raising here keeps the
         # previous cache and lets STALE_SEC do its job, instead of serving nothing.
         raise ValueError("LIST VAR returned no variables -- empty or broken response")
     return out
+
+
+def error_kind(e):
+    """Short, stable name for the kind of error -- the basis for "error kind changed"
+    and for the summary at the end of a fault."""
+    if isinstance(e, UpstreamErr):
+        return str(e)
+    if isinstance(e, (socket.timeout, TimeoutError)):
+        return "timeout (UPS not answering)"
+    if isinstance(e, ConnectionRefusedError):
+        return f"connection refused (port {UPSTREAM_PORT} closed)"
+    if isinstance(e, ConnectionResetError):
+        return "connection reset"
+    if isinstance(e, OSError) and e.errno in (113, 101, 110):
+        return f"UPS unreachable ({e.strerror})"
+    return f"{type(e).__name__}: {e}"
 
 
 # Event-detection state -- deliberately separate from the cache: the cache may go stale
@@ -402,6 +502,59 @@ def detect_status_change(v):
     return messages
 
 
+def _notify(kind, title, text, prio, tags, fields):
+    """Deliver a fault notification in the background."""
+    asyncio.create_task(asyncio.to_thread(_deliver, kind, title, text, prio, tags, fields))
+
+
+# Ongoing fault: start, current error kind, all kinds seen so far, notified yet?
+fault = {"since": 0.0, "kind": "", "kinds": {}, "notified": False}
+
+
+def fault_error(e, consecutive_errors):
+    kind = error_kind(e)
+    now = time.time()
+    if not fault["since"]:
+        fault.update(since=now, kind=kind, kinds={kind: 1}, notified=False)
+        log(f"FAULT BEGINS: {kind} (upstream login: {UPSTREAM_USER or 'anonymous'})")
+        return
+    fault["kinds"][kind] = fault["kinds"].get(kind, 0) + 1
+    if kind != fault["kind"]:
+        log(f"FAULT: error kind changes after {now - fault['since']:.0f}s: "
+            f"{fault['kind']} -> {kind}")
+        fault["kind"] = kind
+    duration = now - fault["since"]
+    if not fault["notified"] and duration >= FAULT_ALERT_SEC:
+        fault["notified"] = True
+        log(f"FAULT has lasted {duration:.0f}s -- notifying")
+        _notify("upstream_fault", "UPS: NUT not answering",
+                f"No data from the UPS for {duration:.0f} s.\n"
+                f"Cause according to the UPS: {kind}\n\n"
+                f"While this lasts, no client behind the proxy can shut down cleanly "
+                f"on a power failure.",
+                4, ["warning", "electric_plug"],
+                {"error": kind, "duration_s": round(duration, 1),
+                 "failures": consecutive_errors})
+
+
+def fault_end(consecutive_errors):
+    if not fault["since"]:
+        return
+    duration = time.time() - fault["since"]
+    kinds = ", ".join(f"{k} ({n}x)" for k, n in fault["kinds"].items())
+    log(f"FAULT ENDS after {duration:.0f}s and {consecutive_errors} failed polls. "
+        f"Error kinds: {kinds}")
+    if fault["notified"]:
+        _notify("upstream_back", "UPS: NUT reachable again",
+                f"Data again after "
+                f"{f'{duration / 60:.0f} min' if duration >= 120 else f'{duration:.0f} s'}.\n"
+                f"Error kinds: {kinds}",
+                3, ["white_check_mark", "electric_plug"],
+                {"error": fault["kind"], "duration_s": round(duration, 1),
+                 "failures": consecutive_errors})
+    fault.update(since=0.0, kind="", kinds={}, notified=False)
+
+
 async def poll_loop():
     """The ONLY thing in this process that opens connections to the real UPS."""
     consecutive_errors = 0
@@ -424,13 +577,15 @@ async def poll_loop():
                         _deliver, kind, title, text, prio, tags, fields))
             if consecutive_errors > 0:
                 log(f"Upstream reachable again after {consecutive_errors} failures")
+                fault_end(consecutive_errors)
             consecutive_errors = 0
         except Exception as e:
             consecutive_errors += 1
             cache["poll_errors"] += 1
+            fault_error(e, consecutive_errors)
             # Log the first few and then rarely, so a longer fault does not flood.
             if consecutive_errors <= 3 or consecutive_errors % 20 == 0:
-                log(f"Upstream error ({consecutive_errors} in a row): {e}")
+                log(f"Upstream error ({consecutive_errors} in a row): {error_kind(e)}")
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -453,6 +608,7 @@ def reset_close(writer):
 
 def upstream_fsd():
     with socket.create_connection((UPSTREAM_HOST, UPSTREAM_PORT), timeout=5) as s:
+        _login(s, s.makefile("rb"))
         s.sendall(f"FSD {UPS_NAME}\n".encode())
         s.recv(256)
         s.sendall(b"LOGOUT\n")
@@ -463,7 +619,7 @@ async def handle_client(reader, writer):
 
     if not is_fresh():
         log(f"{peer}: cache stale ({time.time() - cache['last_success']:.0f}s) "
-            "-- connection reset immediately")
+            "-- connection reset immediately", to_file=False)
         reset_close(writer)
         return
 
@@ -561,6 +717,8 @@ async def main():
     log(f"  poll every {POLL_INTERVAL}s, serving stale-reset after {STALE_SEC}s")
     log(f"  stuck-CAL protection: flag removed from delivered ups.status after "
         f"{CAL_MAX_SEC:.0f}s")
+    log(f"  upstream login: {UPSTREAM_USER or 'none (anonymous)'}; "
+        f"log file: {LOG_FILE or 'none'}; fault notification after {FAULT_ALERT_SEC:.0f}s")
     if EVENT_ALERTS:
         log(f"  event alerts ON (ntfy {NTFY_URL or 'disabled'} topic {NTFY_TOPIC}, "
             f"influx {INFLUX_URL or 'disabled'} db {INFLUX_DB})")

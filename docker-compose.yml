@@ -5,6 +5,15 @@ services:
     restart: unless-stopped
     ports:
       - "3493:3493"
+    # Optional: UPSTREAM_USER / UPSTREAM_PASS for the login towards the UPS. Keep them
+    # in .env (git-ignored), not in this file. Deliberately not required: a proxy that
+    # refuses to start would leave every upsmon behind it blind.
+    env_file:
+      - path: .env
+        required: false
+    # Optional: keep the fault log across container recreates (see LOG_FILE below).
+    # volumes:
+    #   - ./log:/log
     environment:
       # --- required ---------------------------------------------------------
       # The NUT server inside your UPS. Not a hostname you made up -- the
@@ -29,3 +38,7 @@ services:
       # NTFY_TOPIC: "ups"
       # INFLUX_URL: "http://influxdb:8086"
       # INFLUX_DB: "hardware"
+
+      # --- optional: fault log --------------------------------------------
+      # LOG_FILE: "/log/nut-cache-proxy.log"   # needs the volume above
+      # FAULT_ALERT_SEC: "60"                  # notify after this long

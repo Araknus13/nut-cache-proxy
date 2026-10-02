@@ -9,28 +9,71 @@ Covers:
   2. GET VAR for a known and an unknown variable
   3. the upstream is polled ONCE per interval, no matter how many clients connect
   4. a stuck CAL flag is stripped after CAL_MAX_SEC, and the status stays meaningful
-  5. when the upstream dies, connections are RESET rather than served stale data
+  5. the proxy logs in upstream (USERNAME/PASSWORD) before LIST VAR, without LOGIN
+  6. an upstream ERR is named verbatim (not "timed out"), and the fault gets a start
+     and an end in the log file -- while per-client reset lines stay out of the file
+  7. when the upstream dies, connections are RESET rather than served stale data
 
 Run:  python test_proxy.py
 """
+import atexit
 import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
 UPSTREAM_PORT = 33493
 PROXY_PORT = 33494
+USER, PASSWORD = "monuser", "test-only-password"
 
 status_to_serve = "OL"
+deny_all = False              # answer every LIST VAR with ERR ACCESS-DENIED
 upstream_connections = 0
+upstream_commands = []        # (connection number, command verb) as seen by the fake UPS
 upstream_running = True
 _lock = threading.Lock()
 
 
+def handle_upstream(conn, number):
+    """One NUT session, line by line, like the real server."""
+    logged_in = user_ok = False
+    f = conn.makefile("rb")
+    while True:
+        raw = f.readline()
+        if not raw:
+            return
+        line = raw.decode(errors="replace").strip()
+        verb = line.split(" ", 1)[0].upper()
+        with _lock:
+            upstream_commands.append((number, verb))
+        if verb == "USERNAME":
+            user_ok = line == f"USERNAME {USER}"
+            conn.sendall(b"OK\n")
+        elif verb == "PASSWORD":
+            logged_in = user_ok and line == f"PASSWORD {PASSWORD}"
+            conn.sendall(b"OK\n" if logged_in else b"ERR ACCESS-DENIED\n")
+        elif line.startswith("LIST VAR"):
+            if deny_all or not logged_in:
+                conn.sendall(b"ERR ACCESS-DENIED\n")
+                continue
+            conn.sendall((
+                "BEGIN LIST VAR ups\n"
+                f'VAR ups ups.status "{status_to_serve}"\n'
+                'VAR ups battery.charge "100"\n'
+                'VAR ups input.voltage "230.1"\n'
+                "END LIST VAR ups\n").encode())
+        elif verb == "LOGOUT":
+            conn.sendall(b"OK Goodbye\n")
+            return
+        else:
+            conn.sendall(b"ERR UNKNOWN-COMMAND\n")
+
+
 def fake_upstream():
-    """A minimal NUT server: answers LIST VAR and counts connections."""
+    """A minimal NUT server that requires a login and counts connections."""
     global upstream_connections
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -44,18 +87,10 @@ def fake_upstream():
             continue
         with _lock:
             upstream_connections += 1
+            number = upstream_connections
         try:
             conn.settimeout(2)
-            data = conn.recv(4096).decode(errors="replace")
-            if data.startswith("LIST VAR"):
-                body = (
-                    "BEGIN LIST VAR ups\n"
-                    f'VAR ups ups.status "{status_to_serve}"\n'
-                    'VAR ups battery.charge "100"\n'
-                    'VAR ups input.voltage "230.1"\n'
-                    "END LIST VAR ups\n"
-                )
-                conn.sendall(body.encode())
+            handle_upstream(conn, number)
         except Exception:
             pass
         finally:
@@ -87,26 +122,42 @@ def check(name, condition, detail=""):
     return bool(condition)
 
 
+def read_file(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
 def main():
-    global status_to_serve, upstream_running
+    global status_to_serve, upstream_running, deny_all
 
     threading.Thread(target=fake_upstream, daemon=True).start()
     time.sleep(0.3)
 
+    log_file = os.path.join(tempfile.mkdtemp(prefix="nut-proxy-test-"), "proxy.log")
     env = dict(os.environ)
     env.update({
         "UPSTREAM_HOST": "127.0.0.1",
         "UPSTREAM_PORT": str(UPSTREAM_PORT),
+        "UPSTREAM_USER": USER,
+        "UPSTREAM_PASS": PASSWORD,
         "LISTEN_HOST": "127.0.0.1",
         "LISTEN_PORT": str(PROXY_PORT),
         "POLL_INTERVAL": "1",
         "STALE_SEC": "3",
         "CAL_MAX_SEC": "4",
         "EVENT_ALERTS": "false",
+        "LOG_FILE": log_file,
+        "FAULT_ALERT_SEC": "60",
     })
     proc = subprocess.Popen([sys.executable, "-u", "nut_proxy.py"], env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True)
+    # Never leave the proxy behind if a check crashes -- a leftover process keeps the
+    # port and makes the next run fail for a reason that has nothing to do with the code.
+    atexit.register(lambda: proc.poll() is None and proc.kill())
     time.sleep(2.5)
 
     ok = True
@@ -137,7 +188,7 @@ def main():
     status_to_serve = "OL CAL"
     time.sleep(2)
     r = ask(PROXY_PORT, "LIST VAR ups")
-    ok &= check("fresh CAL is passed through", "OL CAL" in r, r.split("\n")[1])
+    ok &= check("fresh CAL is passed through", "OL CAL" in r, (r.split("\n") + ["", ""])[1])
     time.sleep(4)
     r = ask(PROXY_PORT, "LIST VAR ups")
     ok &= check("standing CAL is stripped", "CAL" not in r)
@@ -145,7 +196,40 @@ def main():
     status_to_serve = "OL"
     time.sleep(2)
 
-    print("\n5) Upstream dead -> connection reset, no stale data")
+    print("\n5) Upstream login")
+    with _lock:
+        sessions = {}
+        for number, verb in upstream_commands:
+            sessions.setdefault(number, []).append(verb)
+    polls = [v for v in sessions.values() if "LIST" in v]
+    ok &= check("every poll logs in before LIST VAR",
+                polls and all(v[:3] == ["USERNAME", "PASSWORD", "LIST"] for v in polls),
+                f"{len(polls)} polls, e.g. {polls[0] if polls else '-'}")
+    ok &= check("no LOGIN <ups> upstream",
+                not any("LOGIN" in v for v in sessions.values()))
+
+    print("\n6) Upstream ERR is named, fault gets start and end")
+    deny_all = True
+    time.sleep(5)                       # past STALE_SEC: clients get reset now
+    try:
+        ask(PROXY_PORT, "LIST VAR ups")
+    except OSError:
+        pass
+    deny_all = False
+    time.sleep(2.5)
+    r = ask(PROXY_PORT, "LIST VAR ups")
+    ok &= check("serving again after the fault", 'ups.status "OL"' in r)
+    text = read_file(log_file)
+    ok &= check("ERR named verbatim in the fault start",
+                "FAULT BEGINS: LIST VAR: ERR ACCESS-DENIED" in text)
+    # Both halves, or an empty log file would pass this vacuously.
+    ok &= check("no misleading 'timed out'",
+                "ACCESS-DENIED" in text and "timed out" not in text.lower())
+    ok &= check("fault end with duration in the log file", "FAULT ENDS after" in text)
+    ok &= check("per-client reset lines stay out of the file",
+                "connection reset immediately" not in text)
+
+    print("\n7) Upstream dead -> connection reset, no stale data")
     upstream_running = False
     time.sleep(5)
     try:

@@ -102,6 +102,8 @@ upsc ups@nut-proxy-host
 | `UPSTREAM_PORT` | `3493` | Its port |
 | `UPS_NAME` | `ups` | UPS name as the upstream knows it |
 | `UPS_DESCRIPTION` | `UPS (via nut-cache-proxy)` | Shown in `LIST UPS` |
+| `UPSTREAM_USER` | *(empty)* | Log in to the UPS with `USERNAME`/`PASSWORD` before each query. Empty = anonymous — see below |
+| `UPSTREAM_PASS` | *(empty)* | Password for that user. Put both in an env file, not in the compose file |
 | `LISTEN_HOST` | `0.0.0.0` | Listener bind address |
 | `LISTEN_PORT` | `3493` | Listener port |
 | `POLL_INTERVAL` | `3` | Seconds between upstream polls. Keep it **below** your clients' `POLLFREQ` |
@@ -113,6 +115,8 @@ upsc ups@nut-proxy-host
 | `INFLUX_URL` | *(empty)* | InfluxDB 1.x base URL. Empty disables |
 | `INFLUX_DB` | `hardware` | Target database |
 | `EVENT_MEASUREMENT` | `ups_event` | Measurement for event points |
+| `LOG_FILE` | *(empty)* | Also write the log to this file (rotating, 5 × 2 MB). Put it on a bind mount — `docker logs` does not survive a recreate |
+| `FAULT_ALERT_SEC` | `60` | Notify once upstream has been failing this long. Independent of `EVENT_ALERTS`; only needs `NTFY_URL` / `INFLUX_URL` |
 
 ## ⛔ The stuck CAL flag — read this before you restart the container
 
@@ -145,6 +149,38 @@ The proxy is the single point every client hangs off, so the trap is defused her
 
 Set `CAL_MAX_SEC` high enough that it can never interfere with a running self-test. The
 default of 120 s is an order of magnitude above every real calibration observed here.
+
+## Logging in upstream, and naming the actual error
+
+After rebooting itself, the UPS this was written for refused **every anonymous query** with
+`ERR ACCESS-DENIED` — for 9 h 19 min, and across a firmware change. A single login with
+a monitoring user fixed it at once, and afterwards even anonymous queries worked again.
+
+So the proxy can log in before every `LIST VAR` and `FSD`: set `UPSTREAM_USER` and
+`UPSTREAM_PASS` (for example in an `.env` file next to the compose file, which is
+git-ignored here). It sends `USERNAME`/`PASSWORD` only — **not** `LOGIN <ups>`, which
+would register a monitoring client inside the UPS and is not needed for reading.
+
+The same incident had a second lesson. For nine hours the log said *timed out*, while
+the UPS was answering within 0.1 s with `ERR ACCESS-DENIED` — the reader was waiting for
+`END LIST`, which never came. The error message hid the cause. Now:
+
+- every `ERR` line from the UPS is reported **verbatim**
+- a fault gets a **start**, every **change of error kind**, and an **end with its
+  duration** and a count per error kind
+- with `LOG_FILE` set, those lines land in a file that survives a container recreate
+  (the per-client reset lines, which can be dozens a minute, stay out of it)
+- once a fault lasts longer than `FAULT_ALERT_SEC`, a notification goes out **with the
+  cause**, and another when it ends
+
+From the test run (`python test_proxy.py`, fake upstream switched to deny for a few
+seconds, then stopped):
+
+```
+FAULT BEGINS: LIST VAR: ERR ACCESS-DENIED (upstream login: monuser)
+FAULT ENDS after 5s and 5 failed polls. Error kinds: LIST VAR: ERR ACCESS-DENIED (5x)
+FAULT BEGINS: connection refused (port 33493 closed) (upstream login: monuser)
+```
 
 ## Design notes
 
@@ -197,8 +233,13 @@ the problem this solves.
 3) Connection budget: 12 client queries add no per-query upstream load
      -- 2 upstream connections (the polls only)
 4) Stuck CAL flag: passed through while fresh, stripped once standing
-5) Upstream dead -> connection reset, no stale data
+5) Upstream login: USERNAME/PASSWORD before every LIST VAR, no LOGIN <ups>
+6) Upstream ERR is named verbatim, fault gets start and end in the log file
+7) Upstream dead -> connection reset, no stale data
 ```
+
+The fake upstream requires a login and can be switched to answer `ERR ACCESS-DENIED`,
+so checks 5 and 6 fail against a proxy that does not log in or does not name the error.
 
 ## Status
 
