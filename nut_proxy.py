@@ -154,6 +154,9 @@ NTFY_URL = os.environ.get("NTFY_URL", "")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "ups")
 INFLUX_URL = os.environ.get("INFLUX_URL", "")
 INFLUX_DB = os.environ.get("INFLUX_DB", "hardware")
+# Optional API token, sent as "Authorization: Token <value>" -- what InfluxDB 3 expects on its
+# v1-compatible /write endpoint. Leave empty for an InfluxDB 1.x without authentication.
+INFLUX_TOKEN = os.environ.get("INFLUX_TOKEN", "")
 EVENT_MEASUREMENT = os.environ.get("EVENT_MEASUREMENT", "ups_event")
 EVENT_HOST_TAG = os.environ.get("EVENT_HOST_TAG", "ups")
 
@@ -168,7 +171,7 @@ LOG_FILE = os.environ.get("LOG_FILE", "")
 # It still only notifies if NTFY_URL / INFLUX_URL are set.
 FAULT_ALERT_SEC = float(os.environ.get("FAULT_ALERT_SEC", "60"))
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 _file_log = None
 if LOG_FILE:
@@ -248,7 +251,8 @@ def influx_write_event(kind, fields):
         line = (f"{EVENT_MEASUREMENT},host={EVENT_HOST_TAG},kind={kind} "
                 + ",".join(parts))
         url = f"{INFLUX_URL.rstrip('/')}/write?db={INFLUX_DB}"
-        req = urllib.request.Request(url, data=line.encode(), method="POST")
+        headers = {"Authorization": f"Token {INFLUX_TOKEN}"} if INFLUX_TOKEN else {}
+        req = urllib.request.Request(url, data=line.encode(), method="POST", headers=headers)
         urllib.request.urlopen(req, timeout=10).read()
     except Exception as e:
         log(f"InfluxDB error on event '{kind}': {e}")
@@ -721,7 +725,8 @@ async def main():
         f"log file: {LOG_FILE or 'none'}; fault notification after {FAULT_ALERT_SEC:.0f}s")
     if EVENT_ALERTS:
         log(f"  event alerts ON (ntfy {NTFY_URL or 'disabled'} topic {NTFY_TOPIC}, "
-            f"influx {INFLUX_URL or 'disabled'} db {INFLUX_DB})")
+            f"influx {INFLUX_URL or 'disabled'} db {INFLUX_DB}"
+            f"{', with token' if INFLUX_TOKEN else ''})")
     else:
         log("  event alerts off")
 

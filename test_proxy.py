@@ -13,6 +13,8 @@ Covers:
   6. an upstream ERR is named verbatim (not "timed out"), and the fault gets a start
      and an end in the log file -- while per-client reset lines stay out of the file
   7. when the upstream dies, connections are RESET rather than served stale data
+  8. fault events reach a (fake) InfluxDB with "Authorization: Token ...", and the token
+     shows up in no log
 
 Run:  python test_proxy.py
 """
@@ -24,17 +26,33 @@ import sys
 import tempfile
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UPSTREAM_PORT = 33493
 PROXY_PORT = 33494
+INFLUX_PORT = 33495
 USER, PASSWORD = "monuser", "test-only-password"
+INFLUX_TOKEN = "test-only-token"
 
 status_to_serve = "OL"
 deny_all = False              # answer every LIST VAR with ERR ACCESS-DENIED
 upstream_connections = 0
 upstream_commands = []        # (connection number, command verb) as seen by the fake UPS
 upstream_running = True
+influx_writes = []            # (path, Authorization header, body) as seen by the fake InfluxDB
 _lock = threading.Lock()
+
+
+class FakeInflux(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
+        with _lock:
+            influx_writes.append((self.path, self.headers.get("Authorization"), body))
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
 
 
 def handle_upstream(conn, number):
@@ -134,6 +152,8 @@ def main():
     global status_to_serve, upstream_running, deny_all
 
     threading.Thread(target=fake_upstream, daemon=True).start()
+    influx = ThreadingHTTPServer(("127.0.0.1", INFLUX_PORT), FakeInflux)
+    threading.Thread(target=influx.serve_forever, daemon=True).start()
     time.sleep(0.3)
 
     log_file = os.path.join(tempfile.mkdtemp(prefix="nut-proxy-test-"), "proxy.log")
@@ -150,7 +170,11 @@ def main():
         "CAL_MAX_SEC": "4",
         "EVENT_ALERTS": "false",
         "LOG_FILE": log_file,
-        "FAULT_ALERT_SEC": "60",
+        # Short, so the 5 s fault in test 6 is long enough to notify -- that is what
+        # produces the InfluxDB writes test 8 looks at.
+        "FAULT_ALERT_SEC": "2",
+        "INFLUX_URL": f"http://127.0.0.1:{INFLUX_PORT}",
+        "INFLUX_TOKEN": INFLUX_TOKEN,
     })
     proc = subprocess.Popen([sys.executable, "-u", "nut_proxy.py"], env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -244,6 +268,22 @@ def main():
     except subprocess.TimeoutExpired:
         proc.kill()
         output = ""
+
+    print("\n8) Fault events reach InfluxDB with the token")
+    with _lock:
+        writes = list(influx_writes)
+    kinds = [b.split(",kind=")[1].split(" ")[0] for _, _, b in writes if ",kind=" in b]
+    ok &= check("fault start and end written",
+                "upstream_fault" in kinds and "upstream_back" in kinds, f"kinds: {kinds}")
+    ok &= check("every write carries 'Authorization: Token <token>'",
+                writes and all(a == f"Token {INFLUX_TOKEN}" for _, a, _ in writes),
+                f"{len(writes)} writes, e.g. {writes[0][1] if writes else '-'}")
+    ok &= check("v1 /write endpoint with the database",
+                writes and all(p == "/write?db=hardware" for p, _, _ in writes))
+    # The token must never end up where people paste logs from.
+    ok &= check("token appears in neither stdout nor the log file",
+                output and INFLUX_TOKEN not in output and INFLUX_TOKEN not in read_file(log_file))
+    influx.shutdown()
 
     print("\n--- proxy log ---")
     for line in output.strip().split("\n"):

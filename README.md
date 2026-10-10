@@ -112,8 +112,9 @@ upsc ups@nut-proxy-host
 | `EVENT_ALERTS` | `false` | Enable status-change notifications |
 | `NTFY_URL` | *(empty)* | ntfy **root** URL, e.g. `http://ntfy:80`. Empty disables |
 | `NTFY_TOPIC` | `ups` | ntfy topic |
-| `INFLUX_URL` | *(empty)* | InfluxDB 1.x base URL. Empty disables |
+| `INFLUX_URL` | *(empty)* | InfluxDB base URL; events go to its v1 `/write` endpoint (InfluxDB 1.x, or 3 e.g. `http://influxdb3:8181`). Empty disables |
 | `INFLUX_DB` | `hardware` | Target database |
+| `INFLUX_TOKEN` | *(empty)* | API token, sent as `Authorization: Token …` — needed for InfluxDB 3. Put it in an env file. Empty = no auth (InfluxDB 1.x) |
 | `EVENT_MEASUREMENT` | `ups_event` | Measurement for event points |
 | `LOG_FILE` | *(empty)* | Also write the log to this file (rotating, 5 × 2 MB). Put it on a bind mount — `docker logs` does not survive a recreate |
 | `FAULT_ALERT_SEC` | `60` | Notify once upstream has been failing this long. Independent of `EVENT_ALERTS`; only needs `NTFY_URL` / `INFLUX_URL` |
