@@ -157,7 +157,7 @@ After rebooting itself, the UPS this was written for refused **every anonymous q
 `ERR ACCESS-DENIED` — for 9 h 19 min, and across a firmware change. A single login with
 a monitoring user fixed it at once, and afterwards even anonymous queries worked again.
 
-So the proxy can log in before every `LIST VAR` and `FSD`: set `UPSTREAM_USER` and
+So the proxy can log in before every `LIST VAR`: set `UPSTREAM_USER` and
 `UPSTREAM_PASS` (for example in an `.env` file next to the compose file, which is
 git-ignored here). It sends `USERNAME`/`PASSWORD` only — **not** `LOGIN <ups>`, which
 would register a monitoring client inside the UPS and is not needed for reading.
@@ -214,8 +214,12 @@ wrong answer is worse than a visible error.
 
 - **No session multiplexing.** The UPS keeps login/primary state per connection, so
   forwarding individual sessions would be risky. This does read-through caching instead.
-- **`FSD` is not simulated.** A client sending `FSD <ups>` has it forwarded to the real
-  UPS as a genuine one-off write.
+- **No `FSD`.** A client sending `FSD <ups>` gets `ERR ACCESS-DENIED`; nothing reaches the
+  UPS. An FSD flag set by the UPS itself still passes through in `ups.status`.
+  ⚠️ **Up to v1.2 the proxy forwarded `FSD` without checking who sent it** — and, with
+  `UPSTREAM_USER` set, logged in upstream to do so. Anyone who could reach the listener
+  could trigger a forced shutdown of every machine on that UPS. Fixed in v1.3; if you run
+  an older version, update, or at least keep the listener off untrusted networks.
 - **No `INSTCMD`.** Active commands such as test alarms are not supported.
 
 ## Tests
@@ -246,7 +250,7 @@ so checks 5 and 6 fail against a proxy that does not log in or does not name the
 
 Running in production since August 2026 in front of several `upsmon` instances, a metrics
 poller and a shutdown watchdog. Tested against one specific network-attached UPS; the
-protocol surface used (`LIST VAR`, `GET VAR`, `LIST UPS`, `VER`, `NETVER`, `FSD`) is
+protocol surface used (`LIST VAR`, `GET VAR`, `LIST UPS`, `VER`, `NETVER`) is
 standard NUT, but reports from other hardware are welcome.
 
 ## License

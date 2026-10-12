@@ -28,9 +28,11 @@ WHAT IS DELIBERATELY NOT IMPLEMENTED
   * No multiplexing of individual NUT sessions onto the upstream. That would be risky,
     because the UPS keeps login/primary state per connection. This does read-through
     caching instead: one view of the variables, arbitrarily many downstream readers.
-  * FSD (forced shutdown) is NOT simulated locally. If a client sends `FSD <ups>` it is
-    forwarded to the real UPS as a genuine one-off write. An FSD flag set by the UPS
-    itself shows up in `ups.status` and passes through the normal cache anyway.
+  * FSD (forced shutdown) is REJECTED with `ERR ACCESS-DENIED` (since v1.3). Up to v1.2 it
+    was forwarded to the real UPS without checking who asked -- and the proxy logged in
+    upstream for it, so an anonymous client on the network could trigger a forced
+    shutdown with the proxy's credentials. No read-only client needs FSD. An FSD flag set
+    by the UPS itself shows up in `ups.status` and still passes through the cache.
   * INSTCMD (active commands such as a test alarm) is not supported.
 
 EVENTS INSTEAD OF SAMPLING
@@ -84,7 +86,7 @@ LOGGING IN UPSTREAM, AND NAMING THE ACTUAL ERROR
 After rebooting itself, the UPS this was written for refused EVERY anonymous query with
 `ERR ACCESS-DENIED` -- for 9 h 19 min, and across a firmware change. A single login with
 a monitoring user fixed it: 28 variables immediately, and afterwards even anonymous
-queries worked again. So the proxy can now log in before every `LIST VAR` / `FSD`, using
+queries worked again. So the proxy can now log in before every `LIST VAR`, using
 USERNAME/PASSWORD from UPSTREAM_USER/UPSTREAM_PASS (empty = anonymous, as before). It does
 NOT send `LOGIN <ups>` -- that registers a monitoring client inside the UPS and was not
 needed for reading.
@@ -171,7 +173,7 @@ LOG_FILE = os.environ.get("LOG_FILE", "")
 # It still only notifies if NTFY_URL / INFLUX_URL are set.
 FAULT_ALERT_SEC = float(os.environ.get("FAULT_ALERT_SEC", "60"))
 
-VERSION = "1.2"
+VERSION = "1.3"
 
 _file_log = None
 if LOG_FILE:
@@ -610,14 +612,6 @@ def reset_close(writer):
     writer.close()
 
 
-def upstream_fsd():
-    with socket.create_connection((UPSTREAM_HOST, UPSTREAM_PORT), timeout=5) as s:
-        _login(s, s.makefile("rb"))
-        s.sendall(f"FSD {UPS_NAME}\n".encode())
-        s.recv(256)
-        s.sendall(b"LOGOUT\n")
-
-
 async def handle_client(reader, writer):
     peer = writer.get_extra_info("peername")
 
@@ -678,15 +672,9 @@ async def handle_client(reader, writer):
                 reply = ("ERR VAR-NOT-SUPPORTED\n" if val is None
                          else f'VAR {UPS_NAME} {varname} "{val}"\n')
             elif upper.startswith("FSD "):
-                # Rare write command -- deliberately NOT answered from cache, but
-                # forwarded to the real UPS exactly once.
-                try:
-                    await asyncio.to_thread(upstream_fsd)
-                    reply = "OK FSD-SET\n"
-                    log(f"{peer}: FSD forwarded to the real UPS")
-                except Exception as e:
-                    reply = "ERR FSD-FAILED\n"
-                    log(f"{peer}: forwarding FSD failed: {e}")
+                # Rejected, never forwarded (see module header).
+                reply = "ERR ACCESS-DENIED\n"
+                log(f"{peer}: FSD rejected (the proxy does not forward shutdown commands)")
             else:
                 reply = "ERR UNKNOWN-COMMAND\n"
 

@@ -10,6 +10,7 @@ Covers:
   3. the upstream is polled ONCE per interval, no matter how many clients connect
   4. a stuck CAL flag is stripped after CAL_MAX_SEC, and the status stays meaningful
   5. the proxy logs in upstream (USERNAME/PASSWORD) before LIST VAR, without LOGIN
+  5b. FSD from a client is rejected and never reaches the UPS
   6. an upstream ERR is named verbatim (not "timed out"), and the fault gets a start
      and an end in the log file -- while per-client reset lines stay out of the file
   7. when the upstream dies, connections are RESET rather than served stale data
@@ -231,6 +232,17 @@ def main():
                 f"{len(polls)} polls, e.g. {polls[0] if polls else '-'}")
     ok &= check("no LOGIN <ups> upstream",
                 not any("LOGIN" in v for v in sessions.values()))
+
+    print("\n5b) FSD from an anonymous client is rejected, never forwarded")
+    r = ask(PROXY_PORT, "FSD ups")
+    ok &= check("client gets ERR ACCESS-DENIED", "ERR ACCESS-DENIED" in r, r.strip())
+    time.sleep(0.5)
+    with _lock:
+        verbs = [v for _, v in upstream_commands]
+    # Both halves: the fake UPS must have seen traffic at all, or "no FSD" proves nothing.
+    ok &= check("the UPS never receives FSD",
+                "LIST" in verbs and "FSD" not in verbs,
+                f"{len(verbs)} upstream commands, FSD {verbs.count('FSD')}x")
 
     print("\n6) Upstream ERR is named, fault gets start and end")
     deny_all = True
