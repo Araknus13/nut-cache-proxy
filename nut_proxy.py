@@ -78,6 +78,11 @@ flag is passed through unchanged while it is fresh (real self-tests last seconds
 removed from the delivered `ups.status` once it has been standing for longer than
 CAL_MAX_SEC. The RAW status is kept internally and reported.
 
+A CAL flag that is ALREADY set when the proxy starts has an unknown age -- after a restart
+it is almost certainly the stuck flag from before -- so it is removed from the very first
+answer (since v1.4). Up to v1.3 it was treated as fresh and passed through for another
+CAL_MAX_SEC, which re-armed the trap for two minutes right after every restart.
+
 ⛔ If you run this in front of `upsmon`, understand this section before you restart the
 container. A restart of the proxy while a stuck CAL flag is being delivered can shut your
 machines down.
@@ -173,7 +178,7 @@ LOG_FILE = os.environ.get("LOG_FILE", "")
 # It still only notifies if NTFY_URL / INFLUX_URL are set.
 FAULT_ALERT_SEC = float(os.environ.get("FAULT_ALERT_SEC", "60"))
 
-VERSION = "1.3"
+VERSION = "1.4"
 
 _file_log = None
 if LOG_FILE:
@@ -271,6 +276,39 @@ def _read_line(f, what):
     return line.decode(errors="replace").rstrip("\r\n")
 
 
+def parse_var_line(line):
+    """`VAR <ups> <name> "<value>"` -> (name, value), or None.
+
+    Inside the quotes upsd escapes `"` and `\\` with a backslash. Stripping quotes from
+    both ends instead mangles any value that ends in an escaped quote, and the broken
+    escape then goes out to every client.
+    """
+    parts = line.split(" ", 3)
+    if len(parts) != 4:
+        return None
+    name, rest = parts[2], parts[3].strip()
+    if not rest.startswith('"'):
+        return name, rest
+    value = []
+    escaped = False
+    for ch in rest[1:]:
+        if escaped:
+            value.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == '"':
+            break
+        else:
+            value.append(ch)
+    return name, "".join(value)
+
+
+def quote_value(val):
+    """The inverse of parse_var_line: a value as a quoted NUT string."""
+    return '"' + val.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def _login(s, f):
     """USERNAME/PASSWORD, if configured. A rejected login is its own, named error --
     never skipped silently, or you end up searching again."""
@@ -302,9 +340,9 @@ def upstream_list_var():
             if line.startswith("END LIST"):
                 break
             if line.startswith("VAR "):
-                parts = line.split(" ", 3)
-                if len(parts) == 4:
-                    out[parts[2]] = parts[3].strip().strip('"')
+                parsed = parse_var_line(line)
+                if parsed:
+                    out[parsed[0]] = parsed[1]
         s.sendall(b"LOGOUT\n")
     if not out:
         # An empty result is an ERROR, not an empty reading. Raising here keeps the
@@ -332,7 +370,7 @@ def error_kind(e):
 # Event-detection state -- deliberately separate from the cache: the cache may go stale
 # during a fault, but the edge detector should keep its last known state.
 events = {"flags": None, "ob_since": 0.0, "cal_since": 0.0, "cal_filtered": False,
-          "ob_is_selftest": False}
+          "ob_is_selftest": False, "cal_checked": False, "cal_age_unknown": False}
 
 
 def filter_stuck_cal(v):
@@ -351,6 +389,8 @@ def filter_stuck_cal(v):
     status = v.get("ups.status", "")
     flags = status.split()
     now = time.time()
+    first_poll = not events["cal_checked"]
+    events["cal_checked"] = True
 
     if "CAL" not in flags:
         if events["cal_since"]:
@@ -359,9 +399,12 @@ def filter_stuck_cal(v):
             if events["cal_filtered"]:
                 events["cal_since"] = 0.0
                 events["cal_filtered"] = False
+                since = ("since this proxy started" if events["cal_age_unknown"]
+                         else f"after {duration / 60:.0f} min")
+                events["cal_age_unknown"] = False
                 return v, [(
                     "cal_cleared", "UPS calibration flag clean again",
-                    f"The stuck CAL flag cleared after {duration / 60:.0f} min.\n"
+                    f"The stuck CAL flag cleared {since}.\n"
                     f"Status now: {status}.",
                     3, ["white_check_mark"],
                     {"status_text": status or "?", "cal_duration_s": round(duration, 1),
@@ -370,7 +413,17 @@ def filter_stuck_cal(v):
             events["cal_since"] = 0.0
         return v, []
 
-    if not events["cal_since"]:
+    if not events["cal_since"] and first_poll:
+        # CAL already set when this process starts: its age is UNKNOWN, and after a
+        # restart it is most likely the stuck flag from before. Passing it through for
+        # another CAL_MAX_SEC would re-arm the trap right after the restart -- one more
+        # dropped connection in that window and upsmon shuts down. Hiding a genuine
+        # self-test for a few seconds is harmless, so treat it as standing at once.
+        events["cal_since"] = now - CAL_MAX_SEC
+        events["cal_age_unknown"] = True
+        log(f"CAL flag already set at startup (status: {status}) -- age unknown, "
+            "treating it as standing")
+    elif not events["cal_since"]:
         events["cal_since"] = now
         log(f"CAL flag set (status: {status}) -- passing through")
         return v, []
@@ -390,10 +443,11 @@ def filter_stuck_cal(v):
         events["cal_filtered"] = True
         log(f"CAL has been standing for {duration:.0f}s -- removing it from ups.status "
             f"from now on (raw: {status!r}, delivered: {cleaned['ups.status']!r})")
+        standing = ("since before this proxy started" if events["cal_age_unknown"]
+                    else f"continuously for {duration / 60:.0f} min")
         return cleaned, [(
             "cal_stuck", "UPS: stuck calibration flag defused",
-            f"The UPS has been reporting CAL continuously for "
-            f"{duration / 60:.0f} min (raw status: {status}).\n\n"
+            f"The UPS has been reporting CAL {standing} (raw status: {status}).\n\n"
             f"The proxy is now removing the flag from the status delivered to "
             f"upsmon. Without this, the next dropped connection would trigger an "
             f"immediate shutdown.\n\n"
@@ -658,7 +712,7 @@ async def handle_client(reader, writer):
                     return
                 lines = [f"BEGIN LIST VAR {UPS_NAME}"]
                 for k, val in cache["vars"].items():
-                    lines.append(f'VAR {UPS_NAME} {k} "{val}"')
+                    lines.append(f"VAR {UPS_NAME} {k} {quote_value(val)}")
                 lines.append(f"END LIST VAR {UPS_NAME}")
                 reply = "\n".join(lines) + "\n"
             elif upper.startswith("GET VAR "):
@@ -670,7 +724,7 @@ async def handle_client(reader, writer):
                 varname = parts[3] if len(parts) > 3 else ""
                 val = cache["vars"].get(varname)
                 reply = ("ERR VAR-NOT-SUPPORTED\n" if val is None
-                         else f'VAR {UPS_NAME} {varname} "{val}"\n')
+                         else f"VAR {UPS_NAME} {varname} {quote_value(val)}\n")
             elif upper.startswith("FSD "):
                 # Rejected, never forwarded (see module header).
                 reply = "ERR ACCESS-DENIED\n"

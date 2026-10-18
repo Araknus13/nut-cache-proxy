@@ -146,6 +146,11 @@ The proxy is the single point every client hangs off, so the trap is defused her
   seconds, and you want to see them
 - once it has stood for longer than `CAL_MAX_SEC`, it is **removed** from the
   `ups.status` delivered to clients
+- a `CAL` flag that is **already set when the proxy starts** is removed from the first
+  answer on: its age is unknown, and after a restart it is almost certainly the stuck
+  flag from before. Up to v1.3 it was treated as fresh and passed through for another
+  `CAL_MAX_SEC` — two minutes in which the next dropped connection could shut the hosts
+  down again
 - the **raw** status is kept internally, logged, and reported if alerts are on
 
 Set `CAL_MAX_SEC` high enough that it can never interfere with a running self-test. The
@@ -235,9 +240,11 @@ the problem this solves.
 ```
 1) LIST VAR served from cache
 2) GET VAR, known and unknown variable
+2b) Values with escaped quotes and backslashes reach the client unchanged
 3) Connection budget: 12 client queries add no per-query upstream load
      -- 2 upstream connections (the polls only)
 4) Stuck CAL flag: passed through while fresh, stripped once standing
+4b) CAL already set at proxy startup: stripped from the first answer
 5) Upstream login: USERNAME/PASSWORD before every LIST VAR, no LOGIN <ups>
 6) Upstream ERR is named verbatim, fault gets start and end in the log file
 7) Upstream dead -> connection reset, no stale data
