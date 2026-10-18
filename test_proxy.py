@@ -8,7 +8,10 @@ Covers:
   1. LIST VAR is served from cache and matches upstream
   2. GET VAR for a known and an unknown variable
   3. the upstream is polled ONCE per interval, no matter how many clients connect
+  2b. values with escaped quotes and backslashes reach the client unchanged
   4. a stuck CAL flag is stripped after CAL_MAX_SEC, and the status stays meaningful
+  4b. a CAL flag already set when the proxy starts is stripped at once -- its age is
+     unknown, and passing it through for CAL_MAX_SEC re-arms the trap after a restart
   5. the proxy logs in upstream (USERNAME/PASSWORD) before LIST VAR, without LOGIN
   5b. FSD from a client is rejected and never reaches the UPS
   6. an upstream ERR is named verbatim (not "timed out"), and the fault gets a start
@@ -31,9 +34,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UPSTREAM_PORT = 33493
 PROXY_PORT = 33494
+RESTART_PORT = 33496          # a second proxy, started while the UPS reports CAL
 INFLUX_PORT = 33495
 USER, PASSWORD = "monuser", "test-only-password"
 INFLUX_TOKEN = "test-only-token"
+# A value ending in an escaped quote, exactly as upsd puts it on the wire.
+DESCRIPTION_WIRE = r'"C:\\ups \"A\""'
 
 status_to_serve = "OL"
 deny_all = False              # answer every LIST VAR with ERR ACCESS-DENIED
@@ -83,6 +89,7 @@ def handle_upstream(conn, number):
                 f'VAR ups ups.status "{status_to_serve}"\n'
                 'VAR ups battery.charge "100"\n'
                 'VAR ups input.voltage "230.1"\n'
+                f"VAR ups device.description {DESCRIPTION_WIRE}\n"
                 "END LIST VAR ups\n").encode())
         elif verb == "LOGOUT":
             conn.sendall(b"OK Goodbye\n")
@@ -198,6 +205,15 @@ def main():
     r = ask(PROXY_PORT, "GET VAR ups does.not.exist")
     ok &= check("unknown variable -> ERR", "VAR-NOT-SUPPORTED" in r, r.strip())
 
+    print("\n2b) Quoted values survive the round trip")
+    r = ask(PROXY_PORT, "LIST VAR ups")
+    ok &= check("LIST VAR delivers the escaped value unchanged",
+                f"VAR ups device.description {DESCRIPTION_WIRE}\n" in r,
+                next((l for l in r.split("\n") if "description" in l), "-"))
+    r = ask(PROXY_PORT, "GET VAR ups device.description")
+    ok &= check("GET VAR delivers the escaped value unchanged",
+                r == f"VAR ups device.description {DESCRIPTION_WIRE}\n", r.strip())
+
     print("\n3) Connection budget: many clients, one upstream")
     with _lock:
         before = upstream_connections
@@ -264,6 +280,30 @@ def main():
     ok &= check("fault end with duration in the log file", "FAULT ENDS after" in text)
     ok &= check("per-client reset lines stay out of the file",
                 "connection reset immediately" not in text)
+
+    print("\n4b) Proxy (re)started while CAL is already set")
+    status_to_serve = "OL CAL"
+    time.sleep(1.5)                     # the running proxy has polled it by now
+    restarted = subprocess.Popen(
+        [sys.executable, "-u", "nut_proxy.py"],
+        env=dict(env, LISTEN_PORT=str(RESTART_PORT), LOG_FILE="", INFLUX_URL=""),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    atexit.register(lambda: restarted.poll() is None and restarted.kill())
+    time.sleep(2)                       # well inside CAL_MAX_SEC of its first poll
+    r = ask(RESTART_PORT, "LIST VAR ups")
+    ok &= check("first answer after startup carries no CAL",
+                'ups.status "OL"' in r and "CAL" not in r,
+                next((l for l in r.split("\n") if "ups.status" in l), "-"))
+    restarted.terminate()
+    try:
+        restart_output = restarted.communicate(timeout=5)[0]
+    except subprocess.TimeoutExpired:
+        restarted.kill()
+        restart_output = ""
+    ok &= check("startup CAL is logged as age unknown",
+                "already set at startup" in restart_output)
+    status_to_serve = "OL"
+    time.sleep(1.5)
 
     print("\n7) Upstream dead -> connection reset, no stale data")
     upstream_running = False
